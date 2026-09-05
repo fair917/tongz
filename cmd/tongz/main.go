@@ -61,7 +61,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	authority.Prewarm(interceptedHosts(cfg))
+	authority.Prewarm(cfg.Hosts())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	store.StartRefresh(ctx, log)
 
 	var auth string
 	if cfg.ProxyAuth != "" {
@@ -75,8 +79,10 @@ func run() error {
 		CA:      authority,
 		Secrets: store,
 		Auth:    auth,
-		Local:   install.NewHandler(authority.CertPEM()),
-		Log:     log,
+		Local: install.NewHandler(authority.CertPEM(), install.Options{
+			GCPMetadata: cfg.MetadataRule() != nil,
+		}),
+		Log: log,
 	})
 
 	srv := &http.Server{
@@ -86,9 +92,6 @@ func run() error {
 	}
 
 	announce(cfg, store, stateDir, auth != "")
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	errc := make(chan error, 1)
 	go func() {
@@ -129,8 +132,11 @@ func announce(cfg *config.Config, store *secrets.Store, stateDir string, authReq
 		}
 	}
 
-	hosts := interceptedHosts(cfg)
-	fmt.Printf("  intercepting     %s\n", strings.Join(hosts, ", "))
+	for _, action := range []string{"inject", "sign", "respond"} {
+		if hosts := hostsByAction(cfg, action); len(hosts) > 0 {
+			fmt.Printf("  %-16s %s\n", label(action), strings.Join(hosts, ", "))
+		}
+	}
 	if len(cfg.Passthrough) > 0 {
 		names := make([]string, len(cfg.Passthrough))
 		for i, p := range cfg.Passthrough {
@@ -139,16 +145,20 @@ func announce(cfg *config.Config, store *secrets.Store, stateDir string, authReq
 		fmt.Printf("  tunnelling       %s (no credential can be injected)\n", strings.Join(names, ", "))
 	}
 
-	ids := store.IDs()
-	sort.Strings(ids)
-	fmt.Printf("  credentials      %s\n", strings.Join(ids, ", "))
+	fmt.Printf("  credentials      %s\n", strings.Join(store.IDs(), ", "))
 	fmt.Println("  everything else  tunnelled unmodified")
 }
 
-func interceptedHosts(cfg *config.Config) []string {
+// hostsByAction lists the distinct hosts whose rules take the given action, so
+// that the startup output says what happens to each rather than only that it is
+// intercepted.
+func hostsByAction(cfg *config.Config, action string) []string {
 	seen := make(map[string]bool)
 	var hosts []string
 	for _, r := range cfg.Rules {
+		if !strings.HasPrefix(r.Describe(), action) {
+			continue
+		}
 		h := string(r.Match.Host)
 		if !seen[h] {
 			seen[h] = true
@@ -157,6 +167,17 @@ func interceptedHosts(cfg *config.Config) []string {
 	}
 	sort.Strings(hosts)
 	return hosts
+}
+
+func label(action string) string {
+	switch action {
+	case "sign":
+		return "signing"
+	case "respond":
+		return "answering"
+	default:
+		return "injecting"
+	}
 }
 
 func portOf(addr string) string {

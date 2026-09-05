@@ -20,15 +20,24 @@ var setupTemplate string
 
 var setup = template.Must(template.New("setup.sh").Parse(setupTemplate))
 
+// Options tunes what the generated setup script configures.
+type Options struct {
+	// GCPMetadata makes the script export GCE_METADATA_HOST. Google's metadata
+	// clients build their own HTTP client with no proxy support, so they have
+	// to be pointed at the proxy by name.
+	GCPMetadata bool
+}
+
 // Handler serves the install endpoints.
 type Handler struct {
 	caPEM []byte
+	opts  Options
 	mux   *http.ServeMux
 }
 
 // NewHandler builds the handler around the CA certificate to distribute.
-func NewHandler(caPEM []byte) *Handler {
-	h := &Handler{caPEM: bytes.TrimRight(caPEM, "\n"), mux: http.NewServeMux()}
+func NewHandler(caPEM []byte, opts Options) *Handler {
+	h := &Handler{caPEM: bytes.TrimRight(caPEM, "\n"), opts: opts, mux: http.NewServeMux()}
 	h.mux.HandleFunc("GET /install", h.serveSetup)
 	h.mux.HandleFunc("GET /ca.pem", h.serveCA)
 	h.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -55,9 +64,14 @@ func (h *Handler) serveSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var buf bytes.Buffer
-	if err := setup.Execute(&buf, struct{ CAPEM, ProxyURL string }{
-		CAPEM:    string(h.caPEM),
-		ProxyURL: proxyURL,
+	if err := setup.Execute(&buf, struct {
+		CAPEM, ProxyURL, Authority string
+		GCPMetadata                bool
+	}{
+		CAPEM:       string(h.caPEM),
+		ProxyURL:    proxyURL,
+		Authority:   r.Host,
+		GCPMetadata: h.opts.GCPMetadata,
 	}); err != nil {
 		http.Error(w, "tongz: cannot render setup script", http.StatusInternalServerError)
 		return

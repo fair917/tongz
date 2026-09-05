@@ -1,0 +1,52 @@
+# Google Cloud: a metadata server that hands out a worthless token, and real
+# tokens attached on the way out.
+#
+# Google client libraries refuse to build a request when they cannot find
+# ambient credentials, so tongz answers the metadata server they look for. The
+# token it returns is a placeholder. The real one is attached when the request
+# reaches googleapis.com, which is why the container never holds a usable
+# credential even for a moment.
+#
+# On the host: an authenticated gcloud. The access token is read at startup and
+# refreshed in the background, off the request path.
+#
+#   tongz -config examples/gcp.yaml
+#
+# In the container, /install writes GCE_METADATA_HOST for you. It is needed
+# because Google's metadata clients build their own HTTP client and ignore the
+# proxy variables entirely.
+
+listen: 0.0.0.0:8080
+
+secrets:
+  gcp/default:
+    value: exec:gcloud auth print-access-token
+    # Access tokens last about an hour.
+    refresh: 30m
+
+rules:
+  # The metadata server. Answered here; nothing leaves the host.
+  - match: {host: metadata.google.internal}
+    respond:
+      method: gcp-metadata
+      project_id: my-project
+      # Optional. Defaults are derived from project_id.
+      # numeric_project_id: "123456789012"
+      # service_account: agent@my-project.iam.gserviceaccount.com
+      # zone: us-central1-a
+
+  # Libraries that address the metadata server by IP.
+  - match: {host: 169.254.169.254}
+    respond: {method: gcp-metadata, project_id: my-project}
+
+  # The real token, attached per request. Narrow this to the APIs the agent
+  # needs: storage.googleapis.com, bigquery.googleapis.com, and so on.
+  - match: {host: "*.googleapis.com"}
+    inject: {header: Authorization, format: "Bearer {token}"}
+    token: gcp/default
+
+passthrough:
+  # Chromium pins Google's own domains, and an agent driving a browser will
+  # fail against an intercepted certificate. Tunnelled, so no credential can be
+  # injected here — sign-in flows are the agent's own business.
+  - accounts.google.com

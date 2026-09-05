@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"net"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/fair917/tongz/internal/ca"
 	"github.com/fair917/tongz/internal/config"
+	"github.com/fair917/tongz/internal/gcpmeta"
 	"github.com/fair917/tongz/internal/secrets"
 )
 
@@ -292,6 +294,146 @@ func TestKeepAliveServesSecondRequest(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("request %d: status = %d", i, resp.StatusCode)
 		}
+	}
+}
+
+const awsConfig = `
+secrets:
+  aws/default:
+    fields:
+      access_key_id: env:TONGZ_TEST_AKID
+      secret_access_key: env:TONGZ_TEST_SECRET
+rules:
+  - match: {host: "*.amazonaws.com"}
+    sign: {method: aws-sigv4}
+    token: aws/default
+`
+
+func TestSignsAWSRequestWithHostCredentials(t *testing.T) {
+	t.Setenv("TONGZ_TEST_AKID", "AKIDEXAMPLE")
+	t.Setenv("TONGZ_TEST_SECRET", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+	h := newHarness(t, awsConfig, "s3.us-west-2.amazonaws.com", "")
+
+	req, err := http.NewRequest(http.MethodGet, "https://s3.us-west-2.amazonaws.com/my-bucket?list-type=2", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What an SDK with placeholder credentials would have produced.
+	req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKIAPLACEHOLDER/20150830/us-west-2/s3/aws4_request, SignedHeaders=host, Signature=dead")
+
+	resp, err := h.client(t, h.tongzCA, "").Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+
+	auth := h.upstream.header("Authorization")
+	if strings.Contains(auth, "AKIAPLACEHOLDER") || strings.Contains(auth, "dead") {
+		t.Fatalf("the agent's placeholder signature survived: %s", auth)
+	}
+	// The region and service are derived from the hostname.
+	if !strings.Contains(auth, "Credential=AKIDEXAMPLE/") || !strings.Contains(auth, "/us-west-2/s3/aws4_request") {
+		t.Errorf("Authorization = %q, want it signed for us-west-2/s3 with the host credentials", auth)
+	}
+	if h.upstream.header("X-Amz-Date") == "" {
+		t.Error("upstream saw no X-Amz-Date")
+	}
+	if h.upstream.header("X-Amz-Content-Sha256") == "" {
+		t.Error("upstream saw no X-Amz-Content-Sha256 for an S3 request")
+	}
+}
+
+const gcpConfig = `
+secrets:
+  gcp/default: env:TONGZ_TEST_GCP
+rules:
+  - match: {host: metadata.google.internal}
+    respond: {method: gcp-metadata, project_id: agent-sandbox}
+  - match: {host: "*.googleapis.com"}
+    inject: {header: Authorization, format: "Bearer {token}"}
+    token: gcp/default
+`
+
+// The metadata server hands the container a worthless token; the real one is
+// attached only when the request reaches googleapis.com.
+func TestGCPMetadataServesPlaceholderWithoutLeavingTheHost(t *testing.T) {
+	t.Setenv("TONGZ_TEST_GCP", "ya29.real-access-token")
+	h := newHarness(t, gcpConfig, "storage.googleapis.com", "")
+
+	req, err := http.NewRequest(http.MethodGet,
+		"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+	resp, err := h.client(t, h.tongzCA, "").Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), gcpmeta.PlaceholderToken) {
+		t.Errorf("body = %s, want the placeholder token", body)
+	}
+	if strings.Contains(string(body), "ya29.real-access-token") {
+		t.Fatal("the real access token was handed to the container")
+	}
+	if h.upstream.last.Load() != nil {
+		t.Error("the metadata request was forwarded upstream")
+	}
+}
+
+func TestGCPRealTokenInjectedOnGoogleapis(t *testing.T) {
+	t.Setenv("TONGZ_TEST_GCP", "ya29.real-access-token")
+	h := newHarness(t, gcpConfig, "storage.googleapis.com", "")
+
+	req, err := http.NewRequest(http.MethodGet, "https://storage.googleapis.com/storage/v1/b", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A Google client library sends the placeholder it was given.
+	req.Header.Set("Authorization", "Bearer "+gcpmeta.PlaceholderToken)
+
+	resp, err := h.client(t, h.tongzCA, "").Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := h.upstream.header("Authorization"); got != "Bearer ya29.real-access-token" {
+		t.Errorf("upstream saw Authorization = %q, want the real token", got)
+	}
+}
+
+// git over HTTPS authenticates with Basic, carrying the token as the password.
+func TestGitOverHTTPSGetsBasicCredential(t *testing.T) {
+	t.Setenv("TONGZ_TEST_GH", "ghp_example")
+	h := newHarness(t, `
+secrets:
+  github/git: env:TONGZ_TEST_GH
+rules:
+  - match: {host: github.com, path: /*/*/info/refs, method: [GET]}
+    inject: {header: Authorization, format: "Basic {basic:x-access-token}"}
+    token: github/git
+`, "github.com", "")
+
+	resp, err := h.client(t, h.tongzCA, "").Get("https://github.com/fair917/tongz.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:ghp_example"))
+	if got := h.upstream.header("Authorization"); got != want {
+		t.Errorf("upstream saw Authorization = %q, want %q", got, want)
 	}
 }
 

@@ -56,7 +56,10 @@ export http_proxy="{{.ProxyURL}}"
 export https_proxy="{{.ProxyURL}}"
 export NO_PROXY="localhost,127.0.0.1"
 export no_proxy="localhost,127.0.0.1"
-TONGZ_ENV_EOF
+{{if .GCPMetadata}}# Google's metadata clients build their own HTTP client and ignore the proxy
+# variables, so point them straight at tongz.
+export GCE_METADATA_HOST="{{.Authority}}"
+{{end}}TONGZ_ENV_EOF
 chmod 0644 /etc/profile.d/tongz.sh
 
 # Java keeps its own keystore and ignores every variable above.

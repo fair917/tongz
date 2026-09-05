@@ -20,7 +20,7 @@ func get(t *testing.T, h http.Handler, path, host string) *httptest.ResponseReco
 }
 
 func TestServeCA(t *testing.T) {
-	rec := get(t, NewHandler([]byte(testCA)), "/ca.pem", "10.0.0.1:8080")
+	rec := get(t, NewHandler([]byte(testCA), Options{}), "/ca.pem", "10.0.0.1:8080")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -30,7 +30,7 @@ func TestServeCA(t *testing.T) {
 }
 
 func TestSetupScriptEmbedsCAAndProxy(t *testing.T) {
-	rec := get(t, NewHandler([]byte(testCA)), "/install", "10.0.0.1:8080")
+	rec := get(t, NewHandler([]byte(testCA), Options{}), "/install", "10.0.0.1:8080")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -50,7 +50,7 @@ func TestSetupScriptEmbedsCAAndProxy(t *testing.T) {
 
 // The Host header ends up inside the generated shell script.
 func TestSetupScriptRejectsUnsafeHost(t *testing.T) {
-	rec := get(t, NewHandler([]byte(testCA)), "/install", `10.0.0.1:8080"; rm -rf /; echo "`)
+	rec := get(t, NewHandler([]byte(testCA), Options{}), "/install", `10.0.0.1:8080"; rm -rf /; echo "`)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
 	}
@@ -61,7 +61,7 @@ func TestSetupScriptIsValidShell(t *testing.T) {
 	if err != nil {
 		t.Skip("no sh available")
 	}
-	rec := get(t, NewHandler([]byte(testCA)), "/install", "10.0.0.1:8080")
+	rec := get(t, NewHandler([]byte(testCA), Options{}), "/install", "10.0.0.1:8080")
 	cmd := exec.Command(sh, "-n")
 	cmd.Stdin = strings.NewReader(rec.Body.String())
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -69,8 +69,20 @@ func TestSetupScriptIsValidShell(t *testing.T) {
 	}
 }
 
+func TestSetupScriptExportsMetadataHostWhenEnabled(t *testing.T) {
+	off := get(t, NewHandler([]byte(testCA), Options{}), "/install", "10.0.0.1:8080")
+	if strings.Contains(off.Body.String(), "GCE_METADATA_HOST") {
+		t.Error("setup script exports GCE_METADATA_HOST without a metadata rule")
+	}
+
+	on := get(t, NewHandler([]byte(testCA), Options{GCPMetadata: true}), "/install", "10.0.0.1:8080")
+	if !strings.Contains(on.Body.String(), `export GCE_METADATA_HOST="10.0.0.1:8080"`) {
+		t.Error("setup script does not point Google metadata clients at the proxy")
+	}
+}
+
 func TestHealthz(t *testing.T) {
-	rec := get(t, NewHandler([]byte(testCA)), "/healthz", "10.0.0.1:8080")
+	rec := get(t, NewHandler([]byte(testCA), Options{}), "/healthz", "10.0.0.1:8080")
 	if rec.Code != http.StatusOK || rec.Body.String() != "ok\n" {
 		t.Errorf("healthz = %d %q", rec.Code, rec.Body.String())
 	}

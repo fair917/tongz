@@ -16,10 +16,12 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/fair917/tongz/internal/ca"
 	"github.com/fair917/tongz/internal/config"
+	"github.com/fair917/tongz/internal/gcpmeta"
 	"github.com/fair917/tongz/internal/secrets"
 )
 
@@ -101,8 +103,22 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleAbsolute(w, r)
 		return
 	}
-	// Origin-form: a direct request to the proxy itself. Serving the CA here
-	// is what removes the chicken-and-egg problem of trusting the interceptor.
+	// Origin-form: a direct request to the proxy itself.
+	//
+	// Google's metadata clients build their own HTTP client with no proxy
+	// support, so GCE_METADATA_HOST points them straight at this listener.
+	// Their requests arrive here rather than through the rule engine.
+	if rule := p.cfg.MetadataRule(); rule != nil && strings.HasPrefix(r.URL.Path, "/computeMetadata/") {
+		start := time.Now()
+		resp := gcpmeta.Respond(r, rule.Respond)
+		defer resp.Body.Close()
+		p.audit(config.NormalizeHost(r.Host), r.Method, r.URL.EscapedPath(), rule.Describe(), "", resp.StatusCode, start)
+		writeResponse(w, resp)
+		return
+	}
+
+	// Serving the CA here is what removes the chicken-and-egg problem of
+	// trusting the interceptor.
 	if p.local != nil {
 		p.local.ServeHTTP(w, r)
 		return

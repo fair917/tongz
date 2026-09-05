@@ -1,0 +1,54 @@
+# GitHub: REST API, GraphQL, and git over HTTPS.
+#
+# On the host:
+#   GITHUB_TOKEN=ghp_... tongz -config examples/github.yaml
+#
+# In the container: HTTPS_PROXY plus the CA from /install. Nothing else — git
+# needs no credential helper, because the proxy answers the challenge for it.
+
+listen: 0.0.0.0:8080
+
+secrets:
+  # Split this into separate identifiers when you want read and write to carry
+  # different tokens: the audit log then names which one was used.
+  github/token: env:GITHUB_TOKEN
+
+rules:
+  # REST API. Narrow the paths to what the agent actually needs; "/**" here is
+  # a starting point, not a recommendation.
+  - match: {host: api.github.com, path: /repos/**}
+    inject: {header: Authorization, format: "Bearer {token}"}
+    token: github/token
+
+  - match: {host: api.github.com, path: /search/**, method: [GET]}
+    inject: {header: Authorization, format: "Bearer {token}"}
+    token: github/token
+
+  - match: {host: api.github.com, path: /user, method: [GET]}
+    inject: {header: Authorization, format: "Bearer {token}"}
+    token: github/token
+
+  - match: {host: api.github.com, path: /graphql, method: [POST]}
+    inject: {header: Authorization, format: "Bearer {token}"}
+    token: github/token
+
+  # git over HTTPS authenticates with Basic, carrying the token as the
+  # password. These three paths are the whole of the smart HTTP protocol:
+  # discovery, fetch, and push.
+  - match: {host: github.com, path: /*/*/info/refs, method: [GET]}
+    inject: {header: Authorization, format: "Basic {basic:x-access-token}"}
+    token: github/token
+
+  - match: {host: github.com, path: /*/*/git-upload-pack, method: [POST]}
+    inject: {header: Authorization, format: "Basic {basic:x-access-token}"}
+    token: github/token
+
+  # Drop this rule to leave the agent able to fetch but not push.
+  - match: {host: github.com, path: /*/*/git-receive-pack, method: [POST]}
+    inject: {header: Authorization, format: "Basic {basic:x-access-token}"}
+    token: github/token
+
+  # Tarball and zipball downloads, which the API redirects to.
+  - match: {host: codeload.github.com, method: [GET]}
+    inject: {header: Authorization, format: "Basic {basic:x-access-token}"}
+    token: github/token

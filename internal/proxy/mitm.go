@@ -77,7 +77,7 @@ func (p *Proxy) serveOne(conn net.Conn, req *http.Request, scheme, target, host 
 	start := time.Now()
 	path := req.URL.EscapedPath()
 
-	out, rule, deny := p.prepare(req, scheme, target, host)
+	pl, deny := p.makePlan(req, scheme, target, host)
 	if deny != nil {
 		p.audit(host, req.Method, path, "deny", "", deny.status, start)
 		drain(req.Body)
@@ -85,11 +85,20 @@ func (p *Proxy) serveOne(conn net.Conn, req *http.Request, scheme, target, host 
 		return false
 	}
 
-	resp, err := p.upstrm.RoundTrip(out)
+	if pl.local != nil {
+		p.audit(host, req.Method, path, pl.rule.Describe(), "", pl.local.StatusCode, start)
+		drain(req.Body)
+		if err := pl.local.Write(conn); err != nil {
+			return false
+		}
+		return !req.Close
+	}
+
+	resp, err := p.upstrm.RoundTrip(pl.request)
 	if err != nil {
-		p.audit(host, req.Method, path, "upstream-error", rule.Token, http.StatusBadGateway, start)
+		p.audit(host, req.Method, path, "upstream-error", pl.rule.Token, http.StatusBadGateway, start)
 		p.log.Warn("upstream request failed",
-			slog.String("host", host), slog.String("token", rule.Token), slog.Any("error", err))
+			slog.String("host", host), slog.String("token", pl.rule.Token), slog.Any("error", err))
 		drain(req.Body)
 		writeDenial(conn, req, &denial{
 			status: http.StatusBadGateway,
@@ -99,7 +108,7 @@ func (p *Proxy) serveOne(conn net.Conn, req *http.Request, scheme, target, host 
 	}
 	defer resp.Body.Close()
 
-	p.audit(host, req.Method, path, "inject", rule.Token, resp.StatusCode, start)
+	p.audit(host, req.Method, path, pl.rule.Describe(), pl.rule.Token, resp.StatusCode, start)
 	if err := resp.Write(conn); err != nil {
 		return false
 	}
@@ -117,23 +126,26 @@ func (p *Proxy) handleAbsolute(w http.ResponseWriter, r *http.Request) {
 	}
 	path := r.URL.EscapedPath()
 
-	var (
-		out     *http.Request
-		tokenID string
-	)
+	out := r.Clone(r.Context())
+	out.RequestURI = ""
+	out.URL.Host = target
+	sanitize(out.Header)
+	decision, tokenID := "forward", ""
+
 	if p.cfg.Intercepts(host) {
-		prepared, rule, deny := p.prepare(r, "http", target, host)
+		pl, deny := p.makePlan(r, "http", target, host)
 		if deny != nil {
 			p.audit(host, r.Method, path, "deny", "", deny.status, start)
 			http.Error(w, deny.reason, deny.status)
 			return
 		}
-		out, tokenID = prepared, rule.Token
-	} else {
-		out = r.Clone(r.Context())
-		out.RequestURI = ""
-		out.URL.Host = target
-		sanitize(out.Header)
+		if pl.local != nil {
+			p.audit(host, r.Method, path, pl.rule.Describe(), "", pl.local.StatusCode, start)
+			defer pl.local.Body.Close()
+			writeResponse(w, pl.local)
+			return
+		}
+		out, decision, tokenID = pl.request, pl.rule.Describe(), pl.rule.Token
 	}
 
 	resp, err := p.upstrm.RoundTrip(out)
@@ -144,12 +156,11 @@ func (p *Proxy) handleAbsolute(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	decision := "forward"
-	if tokenID != "" {
-		decision = "inject"
-	}
 	p.audit(host, r.Method, path, decision, tokenID, resp.StatusCode, start)
+	writeResponse(w, resp)
+}
 
+func writeResponse(w http.ResponseWriter, resp *http.Response) {
 	for name, values := range resp.Header {
 		for _, v := range values {
 			w.Header().Add(name, v)
