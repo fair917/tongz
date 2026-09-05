@@ -1,0 +1,51 @@
+# AWS: the proxy re-signs every request with Signature Version 4.
+#
+# An AWS SDK will not build a request without credentials, so give the container
+# obviously fake ones. It signs with those; tongz throws that signature away and
+# signs again with the real credentials, which stay on the host.
+#
+# On the host:
+#   AWS_ACCESS_KEY_ID=AKIA... AWS_SECRET_ACCESS_KEY=... tongz -config examples/aws.yaml
+#
+# In the container:
+#   AWS_ACCESS_KEY_ID=tongz-placeholder
+#   AWS_SECRET_ACCESS_KEY=tongz-placeholder
+#   AWS_REGION=us-west-2
+#   AWS_EC2_METADATA_DISABLED=true   # stop the SDK probing for instance credentials
+#
+# Uploads that use chunked payload signing are refused with an explanation:
+# their bodies are signed chunk by chunk with the placeholder key, so they
+# cannot be re-signed without rewriting every chunk.
+
+listen: 0.0.0.0:8080
+
+secrets:
+  aws/default:
+    fields:
+      access_key_id: env:AWS_ACCESS_KEY_ID
+      secret_access_key: env:AWS_SECRET_ACCESS_KEY
+      # Uncomment when the host holds temporary credentials. Pair it with a
+      # refresh interval if the session is short-lived.
+      # session_token: env:AWS_SESSION_TOKEN
+
+rules:
+  # Read-only access to one bucket. The service and region are derived from the
+  # hostname; name them explicitly for endpoints that do not follow the usual
+  # <service>.<region>.amazonaws.com shape.
+  - match:
+      host: "*.s3.us-west-2.amazonaws.com"
+      method: [GET, HEAD]
+    sign: {method: aws-sigv4}
+    token: aws/default
+
+  # A whole service in one region.
+  - match: {host: dynamodb.us-west-2.amazonaws.com}
+    sign: {method: aws-sigv4}
+    token: aws/default
+
+  # Broad access, for comparison. Everything under amazonaws.com signed with one
+  # credential is the least interesting thing this proxy can do: scope the IAM
+  # policy on the credential itself, and keep the rules narrow as well.
+  # - match: {host: "*.amazonaws.com"}
+  #   sign: {method: aws-sigv4}
+  #   token: aws/default

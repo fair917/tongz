@@ -1,0 +1,80 @@
+#!/bin/sh
+# Installs the tongz CA into this container's trust stores.
+#
+# Served by the tongz proxy itself, which is what keeps the CA distribution
+# from needing a trusted channel it does not yet have.
+set -eu
+
+fail() {
+	echo "tongz: $*" >&2
+	echo "tongz: setup did not complete; TLS to intercepted hosts will fail" >&2
+	exit 1
+}
+
+[ "$(id -u)" = "0" ] || fail "must run as root to write the system trust store"
+
+CERT_DIR=/usr/local/share/tongz
+CERT_FILE="$CERT_DIR/tongz-ca.crt"
+BUNDLE_FILE="$CERT_DIR/tongz-bundle.crt"
+
+mkdir -p "$CERT_DIR"
+cat >"$CERT_FILE" <<'TONGZ_CA_PEM_EOF'
+{{.CAPEM}}
+TONGZ_CA_PEM_EOF
+
+# System trust store.
+if command -v update-ca-certificates >/dev/null 2>&1; then
+	mkdir -p /usr/local/share/ca-certificates
+	cp "$CERT_FILE" /usr/local/share/ca-certificates/tongz.crt
+	update-ca-certificates >/dev/null 2>&1 || fail "update-ca-certificates failed"
+	SYSTEM_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+elif command -v update-ca-trust >/dev/null 2>&1; then
+	mkdir -p /etc/pki/ca-trust/source/anchors
+	cp "$CERT_FILE" /etc/pki/ca-trust/source/anchors/tongz.crt
+	update-ca-trust extract || fail "update-ca-trust failed"
+	SYSTEM_BUNDLE=/etc/pki/tls/certs/ca-bundle.crt
+else
+	fail "no system trust store tool found (need update-ca-certificates or update-ca-trust)"
+fi
+
+# Runtimes that ship their own root list read a bundle from the environment
+# rather than the system store, so hand them one that contains both.
+if [ -r "$SYSTEM_BUNDLE" ]; then
+	cat "$SYSTEM_BUNDLE" >"$BUNDLE_FILE"
+else
+	cat "$CERT_FILE" >"$BUNDLE_FILE"
+fi
+
+cat >/etc/profile.d/tongz.sh <<TONGZ_ENV_EOF
+export NODE_EXTRA_CA_CERTS="$CERT_FILE"
+export REQUESTS_CA_BUNDLE="$BUNDLE_FILE"
+export SSL_CERT_FILE="$BUNDLE_FILE"
+export CURL_CA_BUNDLE="$BUNDLE_FILE"
+export HTTP_PROXY="{{.ProxyURL}}"
+export HTTPS_PROXY="{{.ProxyURL}}"
+export http_proxy="{{.ProxyURL}}"
+export https_proxy="{{.ProxyURL}}"
+export NO_PROXY="localhost,127.0.0.1"
+export no_proxy="localhost,127.0.0.1"
+{{if .GCPMetadata}}# Google's metadata clients build their own HTTP client and ignore the proxy
+# variables, so point them straight at tongz.
+export GCE_METADATA_HOST="{{.Authority}}"
+{{end}}TONGZ_ENV_EOF
+chmod 0644 /etc/profile.d/tongz.sh
+
+# Java keeps its own keystore and ignores every variable above.
+if command -v keytool >/dev/null 2>&1; then
+	for store in "${JAVA_HOME:-}/lib/security/cacerts" /etc/ssl/certs/java/cacerts; do
+		[ -w "$store" ] || continue
+		keytool -delete -alias tongz -keystore "$store" -storepass changeit >/dev/null 2>&1 || true
+		keytool -importcert -noprompt -trustcacerts -alias tongz \
+			-file "$CERT_FILE" -keystore "$store" -storepass changeit >/dev/null 2>&1 ||
+			fail "keytool import into $store failed"
+		break
+	done
+fi
+
+echo "tongz: CA installed at $CERT_FILE"
+echo "tongz: proxy is {{.ProxyURL}}"
+echo "tongz: shells get the environment from /etc/profile.d/tongz.sh;"
+echo "tongz: set HTTPS_PROXY in containerEnv for processes that do not read it"

@@ -27,6 +27,10 @@ go.work.sum
 # env file
 .env
 
+# Built binary and the local configuration, which names real secret locations
+/tongz
+/tongz.yaml
+
 # Editor/IDE
 # .idea/
 # .vscode/

@@ -1,0 +1,47 @@
+# Tongz — your agent never touches a credential.
+#
+# Copy to tongz.yaml and adjust. Credentials stay on the host; the container
+# gets HTTPS_PROXY and the CA, nothing else.
+
+# Bind to an address the container can reach. Loopback is the wrong choice:
+# containers cannot reach it and every process on this host can.
+listen: 0.0.0.0:8080
+
+# Where the CA key pair is kept.
+state_dir: ~/.tongz
+
+# Optional shared secret for Proxy-Authorization. This grants use of the proxy,
+# not access to any upstream service, so it may live inside the container.
+# proxy_auth: env:TONGZ_PROXY_SECRET
+
+# Credentials, by identifier. Only the identifier is ever written to the log.
+secrets:
+  github/repo-scoped: env:GITHUB_TOKEN
+  openai/default: file:/run/secrets/openai
+
+# Rules are evaluated in order; the first match wins. A request to an
+# intercepted host that matches no rule is refused, not forwarded bare.
+rules:
+  - match:
+      host: api.github.com
+      path: /repos/*/issues
+      method: [GET, POST]
+    inject:
+      header: Authorization
+      format: "Bearer {token}"
+    token: github/repo-scoped
+
+  # Path segments: "*" matches one segment, "**" matches any number.
+  - match:
+      host: api.openai.com
+      path: /v1/**
+    inject:
+      header: Authorization
+      format: "Bearer {token}"
+    token: openai/default
+
+# Hosts that are tunnelled without decryption, for clients that will not trust
+# the CA — Chromium's pinned Google domains, Rust binaries built against
+# webpki-roots. No credential can be injected into a tunnelled host.
+passthrough:
+  - accounts.google.com
